@@ -1,0 +1,19 @@
+# Core ML / data
+numpy
+pandas
+scikit-learn
+joblib
+tqdm
+
+# OCR (offline once weights are cached)
+easyocr
+# paddleocr           # optional alternative backend, see src/ocr_engine.py
+opencv-python-headless
+transformers          # needed for the "trocr" backend (handwriting), see src/ocr_engine.py
+Pillow
+
+# Similarity (SBERT). If you skip this, similarity.py auto-falls-back to TF-IDF.
+sentence-transformers
+
+# PDF -> image conversion for the Mendeley "Corrected_Pdf" scans
+PyMuPDF
