@@ -14,7 +14,7 @@ from segmenter import QuestionSegment
 EMBEDDING_WEIGHT = 1 / 3
 LLM_WEIGHT = 1 / 3
 RUBRIC_WEIGHT = 1 / 3
-OUTLIER_THRESHOLD = 25  # points: any one signal this far from the blended score -> review
+OUTLIER_THRESHOLD = 25  # points: any one signal this far from the blended score then review
 
 
 @dataclass

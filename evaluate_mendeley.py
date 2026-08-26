@@ -1,11 +1,9 @@
-from pathlib import Path
-import argparse
-import os
-import re
+import argparse, os, re
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from mistralai.client import Mistral
+from groq import Groq
 from sentence_transformers import SentenceTransformer, util
 from pymongo import MongoClient
 
@@ -13,427 +11,305 @@ from calibrator import LLMCalibrator
 from mcq_grader import grade_mcq
 from mendeley_loader import MCQ_QIDS, SHORT_ANSWER_QIDS, load_answer_key
 from segmenter import QuestionSegment
-from short_answer_grader import combine_short_answer_signals
+from rubric_scorer import score_rubric
 
 
 load_dotenv(override=True)
 
-API_KEY = os.getenv("MISTRAL_API_KEY")
-if not API_KEY:
+MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+CALIBRATION_MODEL = os.getenv("CALIBRATION_MODEL", "openai/gpt-oss-120b")
+
+if not MISTRAL_KEY:
     raise RuntimeError("MISTRAL_API_KEY is not set in .env")
+if not GROQ_KEY:
+    raise RuntimeError("GROQ_API_KEY is not set in .env")
 
 OCR_MODEL = "mistral-ocr-latest"
-CALIBRATION_MODEL = "mistral-large-latest"
-
-MENDELEY_DIR = "data"
 MONGO_URI = "mongodb://localhost:27017/aae"
-
 VALID_QIDS = [str(i) for i in range(1, 36)]
 
-# A line is treated as a question header only when the number is known.
-# Allows:
-#   28.
-#   28)
-#   28:
-#   28 -
-#   28.Continuous
-#   28 Continuous
-# It deliberately does not treat "1/total 3" as a header.
-_NUMERIC_HEADER = re.compile(
-    r"(?m)^[ \t]*(\d{1,2})(?!\d)"
-    r"(?![ \t]*/)"                       # reject page markers such as 1/3
-    r"[ \t]*(?:[.)\]:;-][ \t]*)?"        # optional punctuation
+HEADER = re.compile(
+    r"(?m)^[ \t]*(\d{1,2})(?!\d)(?![ \t]*/)"
+    r"[ \t]*(?:[.)\]:;-][ \t]*)?"
 )
 
 
-def clamp_score(value, lo=0.0, hi=100.0):
+def clamp(v):
     try:
-        value = float(value)
+        return max(0, min(100, float(v)))
     except (TypeError, ValueError):
-        return None
-    return max(lo, min(hi, value))
+        return 0
 
 
-def extract_text_from_pdf(pdf_path, client):
-    with open(pdf_path, "rb") as f:
+def ocr_pdf(path, client):
+    with open(path, "rb") as f:
         upload = client.files.upload(
             file={
-                "file_name": os.path.basename(pdf_path),
+                "file_name": os.path.basename(path),
                 "content": f,
             },
             purpose="ocr",
         )
 
-    signed_url = client.files.get_signed_url(file_id=upload.id)
-
+    url = client.files.get_signed_url(file_id=upload.id).url
     response = client.ocr.process(
         model=OCR_MODEL,
         document={
             "type": "document_url",
-            "document_url": signed_url.url,
+            "document_url": url,
         },
     )
+    return "\n".join(p.markdown for p in response.pages)
 
-    return "\n".join(page.markdown for page in response.pages)
 
-
-def embed_similarity_score(embedder, text_a, text_b):
-    if not text_a.strip() or not text_b.strip():
+def similarity(embedder, a, b):
+    if not a.strip() or not b.strip():
         return 0
 
-    a = embedder.encode(text_a, convert_to_tensor=True)
-    b = embedder.encode(text_b, convert_to_tensor=True)
+    x = embedder.encode(
+        a, convert_to_tensor=True, normalize_embeddings=True
+    )
+    y = embedder.encode(
+        b, convert_to_tensor=True, normalize_embeddings=True
+    )
 
-    cosine = util.cos_sim(a, b).item()
-    # Use [0,100] for grading rather than allowing negative values.
-    return round(clamp_score(cosine * 100) or 0)
+    return round(clamp(util.cos_sim(x, y).item() * 100))
 
 
-def split_mendeley_text(text, valid_qids):
-    """
-    OCR-tolerant numeric segmentation.
+def split_mendeley_text(text):
+    matches = [
+        (m.group(1), m)
+        for m in HEADER.finditer(text)
+        if m.group(1) in VALID_QIDS
+    ]
 
-    Returns:
-        segments: first chunk for each qid
-        duplicates: later chunks carrying an already-seen qid
-    """
-    valid = set(valid_qids)
-    raw_matches = []
+    segments, duplicates, seen = {}, [], set()
 
-    for m in _NUMERIC_HEADER.finditer(text):
-        qid = m.group(1)
-        if qid not in valid:
-            continue
-
-        # Reject obvious page/date/table artifacts.
-        line_end = text.find("\n", m.end())
-        if line_end == -1:
-            line_end = len(text)
-        header_line_tail = text[m.end():line_end].strip()
-
-        if header_line_tail.startswith("/"):
-            continue
-
-        raw_matches.append((qid, m))
-
-    segments = {}
-    duplicates = []
-    seen = set()
-
-    for i, (qid, match) in enumerate(raw_matches):
-        start = match.end()
-        end = raw_matches[i + 1][1].start() if i + 1 < len(raw_matches) else len(text)
-        body = text[start:end].strip()
+    for i, (qid, match) in enumerate(matches):
+        end = (
+            matches[i + 1][1].start()
+            if i + 1 < len(matches)
+            else len(text)
+        )
+        body = text[match.end():end].strip()
 
         if not body:
             continue
 
-        if qid not in seen:
+        if qid in seen:
+            duplicates.append((qid, body))
+        else:
             seen.add(qid)
             segments[qid] = body
-        else:
-            duplicates.append((qid, body))
 
     return segments, duplicates
 
 
-def _best_assignment(embedder, chunk_text, missing_qids, answer_key):
-    """
-    Pick the missing qid whose model answer is semantically closest to a
-    duplicate/misnumbered OCR chunk.
-    """
-    if not chunk_text.strip() or not missing_qids:
+def _best_assignment(embedder, text, missing, key):
+    if not text.strip() or not missing:
         return None, 0
 
-    chunk_emb = embedder.encode(chunk_text, convert_to_tensor=True)
+    chunk = embedder.encode(
+        text, convert_to_tensor=True, normalize_embeddings=True
+    )
 
-    candidates = []
-    for qid in missing_qids:
-        model_answer = answer_key[qid].model_answer.strip()
-        if not model_answer:
+    best_q, best_score = None, -1
+
+    for qid in missing:
+        answer = key[qid].model_answer.strip()
+        if not answer:
             continue
 
-        answer_emb = embedder.encode(model_answer, convert_to_tensor=True)
-        sim = util.cos_sim(chunk_emb, answer_emb).item()
-        candidates.append((sim, qid))
+        ref = embedder.encode(
+            answer, convert_to_tensor=True, normalize_embeddings=True
+        )
+        score = util.cos_sim(chunk, ref).item() * 100
 
-    if not candidates:
-        return None, 0
+        if score > best_score:
+            best_q, best_score = qid, score
 
-    sim, qid = max(candidates)
-    return qid, round(clamp_score(sim * 100) or 0)
+    return best_q, round(clamp(best_score))
 
 
-def reconcile_missing_questions(
-    segments,
-    duplicates,
-    answer_key,
-    embedder,
-    min_recovery_similarity=45,
-):
-    """
-    Recover missing short-answer qids from duplicate/misnumbered chunks.
-
-    This is intentionally conservative:
-    - only Q21-Q35 are candidates for recovery
-    - each missing qid can be assigned once
-    - only recover when semantic similarity reaches the threshold
-    """
+def recover_missing(segments, duplicates, key, embedder, threshold=45):
     missing = [
-        qid
-        for qid in SHORT_ANSWER_QIDS
-        if qid in answer_key and qid not in segments
+        q for q in SHORT_ANSWER_QIDS
+        if q in key and q not in segments
     ]
 
     if not missing or not duplicates:
         return segments, []
 
+    remaining = set(missing)
     recovered = []
-    remaining_missing = set(missing)
 
-    # Longer chunks first: they generally carry more answer evidence.
-    candidates = sorted(
-        duplicates,
-        key=lambda item: len(item[1]),
-        reverse=True,
-    )
-
-    for original_qid, chunk in candidates:
-        if not remaining_missing:
+    for src, text in sorted(
+        duplicates, key=lambda x: len(x[1]), reverse=True
+    ):
+        if not remaining:
             break
 
-        target_qid, similarity = _best_assignment(
-            embedder,
-            chunk,
-            sorted(remaining_missing, key=int),
-            answer_key,
+        qid, score = _best_assignment(
+            embedder, text, sorted(remaining, key=int), key
         )
 
-        if target_qid is None or similarity < min_recovery_similarity:
+        if qid is None or score < threshold:
             continue
 
-        segments[target_qid] = chunk
-        remaining_missing.remove(target_qid)
+        segments[qid] = text
+        remaining.remove(qid)
 
-        recovered.append(
-            {
-                "from_qid": original_qid,
-                "to_qid": target_qid,
-                "similarity": similarity,
-            }
-        )
+        recovered.append({
+            "from_qid": src,
+            "to_qid": qid,
+            "similarity": score,
+        })
 
     return segments, recovered
 
 
-def _safe_llm_status(result):
-    llm_result = getattr(result, "llm_result", None)
-    mean = getattr(llm_result, "llm_score_mean", None)
-    std = getattr(llm_result, "llm_score_std", None)
+def build_short_data(segments, key, embedder):
+    qs, embeddings, rubrics = [], {}, {}
 
-    # Different versions of calibrator may expose one of these.
-    status = getattr(llm_result, "calibration_status", None)
-    if status is None:
-        status = getattr(result, "calibration_status", None)
+    for qid in SHORT_ANSWER_QIDS:
+        if qid not in key:
+            continue
 
-    reasoning = getattr(result, "reasoning", "") or ""
+        answer = segments.get(qid, "").strip() or "[No answer provided]"
+        segment = QuestionSegment(
+            qid=qid,
+            model_text=key[qid].model_answer,
+            student_text=answer,
+        )
 
-    return mean, std, status, reasoning
+        qs.append(segment)
+        embeddings[qid] = similarity(
+            embedder,
+            key[qid].model_answer,
+            answer,
+        )
+        rubrics[qid] = score_rubric(
+            key[qid].keypoints,
+            answer,
+        )
 
-
-def _fallback_score(result):
-    """
-    Explicit fallback ONLY when LLM calibration is unavailable.
-    This keeps the score bounded and marks the question for review.
-    """
-    emb = clamp_score(getattr(result, "embedding_score", 0)) or 0
-    rubric_obj = getattr(result, "rubric_result", None)
-    rubric = clamp_score(getattr(rubric_obj, "score", 0)) or 0
-
-    # Do not pretend a failed LLM call has equal evidence to a successful
-    # calibration. Here we use the two deterministic signals only.
-    result.final_score = round((emb + rubric) / 2)
-    result.needs_review = True
-    return result
+    return qs, embeddings, rubrics
 
 
-def grade_student(
-    student_id,
-    pdf_path,
-    answer_key,
-    mistral_client,
-    embedder,
-    calibrator,
-):
-    student_text = extract_text_from_pdf(pdf_path, mistral_client)
+def grade_student(student_id, pdf_path, key, mistral, embedder, calibrator):
+    print(f"OCR provider : Mistral / {OCR_MODEL}")
+    print(f"Calibration provider : Groq / {calibrator.model}")
 
-    segments, duplicates = split_mendeley_text(
-        student_text,
-        VALID_QIDS,
-    )
+    text = ocr_pdf(pdf_path, mistral)
+    segments, duplicates = split_mendeley_text(text)
 
-    original_missing = [
-        qid for qid in VALID_QIDS if qid not in segments
-    ]
-
-    print(
-        f"  OCR segmentation before recovery: "
-        f"{len(segments)}/{len(VALID_QIDS)}"
-    )
-
+    print(f"OCR segmentation before recovery: {len(segments)}/35")
     if duplicates:
-        print(f"  Duplicate/misnumbered chunks: {len(duplicates)}")
+        print(f"Duplicate/misnumbered chunks: {len(duplicates)}")
 
-    segments, recovered = reconcile_missing_questions(
-        segments,
-        duplicates,
-        answer_key,
-        embedder,
+    segments, recovered = recover_missing(
+        segments, duplicates, key, embedder
     )
 
-    if recovered:
-        for item in recovered:
-            print(
-                f"  Recovered OCR chunk {item['from_qid']} -> "
-                f"Q{item['to_qid']} "
-                f"(semantic similarity {item['similarity']})"
-            )
+    for item in recovered:
+        print(
+            f"Recovered OCR chunk {item['from_qid']} -> "
+            f"Q{item['to_qid']} "
+            f"(semantic similarity {item['similarity']})"
+        )
 
     missing = [
-        qid for qid in VALID_QIDS if qid not in segments
+        q for q in VALID_QIDS
+        if q not in segments
     ]
 
-    print(
-        f"  OCR segmentation after recovery: "
-        f"{len(segments)}/{len(VALID_QIDS)}"
-    )
-
+    print(f"OCR segmentation after recovery: {len(segments)}/35")
     if missing:
         print(
             "  Still missing: "
-            + ", ".join("Q" + q for q in missing)
+            + ", ".join(f"Q{q}" for q in missing)
         )
 
-    # -------------------------
-    # MCQ
-    # -------------------------
-    mcq_results = [
+    mcqs = [
         grade_mcq(
             qid,
             segments.get(qid, ""),
-            answer_key[qid],
+            key[qid],
         )
         for qid in MCQ_QIDS
-        if qid in answer_key
+        if qid in key
     ]
 
-    # -------------------------
-    # SHORT ANSWERS
-    # -------------------------
-    # Build every question's segment + embedding score first (both are
-    # local -- no API calls), then grade the whole set in ONE calibrator
-    # call (per self-consistency sample) instead of one call per question.
-    # See calibrator.calibrate_batch for why this is the actual fix for
-    # rate-limit exhaustion, not just a slower version of the old loop.
-    short_segments = []
-    short_key_entries = {}
-    short_embedding_scores = {}
+    qs, embeddings, rubrics = build_short_data(
+        segments, key, embedder
+    )
 
-    for qid in SHORT_ANSWER_QIDS:
-        if qid not in answer_key:
-            continue
+    print(f"Short-answer questions: {len(qs)}")
+    print(
+        f"Starting Groq calibration: "
+        f"{len(qs)} questions, "
+        f"n_samples={calibrator.n_samples}, "
+        f"batch_size={calibrator.batch_size}"
+    )
 
-        key_entry = answer_key[qid]
+    llm = calibrator.calibrate_batch(
+        qs,
+        embeddings,
+    )
 
-        student_body = (
-            segments.get(qid, "").strip()
-            or "[No answer provided]"
-        )
+    short = []
 
-        segment = QuestionSegment(
-            qid=qid,
-            model_text=key_entry.model_answer,
-            student_text=student_body,
-        )
+    for q in qs:
+        llm_result = llm[q.qid]
+        rubric = rubrics[q.qid]
+        emb = embeddings[q.qid]
 
-        short_segments.append(segment)
-        short_key_entries[qid] = key_entry
-        short_embedding_scores[qid] = embed_similarity_score(
-            embedder,
-            key_entry.model_answer,
-            student_body,
-        )
-
-    try:
-        llm_results = calibrator.calibrate_batch(short_segments, short_embedding_scores)
-    except Exception as exc:
-        print(f"    Batch LLM calibration exception: {type(exc).__name__}: {exc}")
-        llm_results = {}
-
-    short_results = []
-
-    for segment in short_segments:
-        qid = segment.qid
-        key_entry = short_key_entries[qid]
-        embedding_score = short_embedding_scores[qid]
-        llm_result = llm_results.get(qid)
-
-        if llm_result is None:
-            # The batch call itself raised before producing any per-
-            # question result -- there is no legitimate LLM score here.
-            print(f"    Q{qid} has no grading result -> REVIEW")
-            continue
-
-        result = combine_short_answer_signals(
-            segment,
-            key_entry,
-            embedding_score,
-            llm_result,
-        )
-
-        llm_mean, llm_std, llm_status, reasoning = _safe_llm_status(result)
-
-        if llm_mean is None:
-            print(
-                f"    Q{qid} LLM unavailable"
-                + (f" (status={llm_status})" if llm_status else "")
-            )
-            if reasoning:
-                print(f"         reason: {reasoning[:240]}")
-
-            result = _fallback_score(result)
+        if llm_result.llm_score_mean is None:
+            final = round((emb + rubric.score) / 2)
         else:
-            result.final_score = round(
-                clamp_score(getattr(result, "final_score", 0)) or 0
+            final = round(
+                0.33 * emb
+                + 0.34 * llm_result.llm_score_mean
+                + 0.33 * rubric.score
             )
 
-        short_results.append(result)
+        review = (
+            llm_result.needs_review
+            or llm_result.calibration_status != "ok"
+        )
 
-    mcq_marks = sum(r.score / 100 for r in mcq_results)
-    short_marks = sum(r.final_score / 100 * 2 for r in short_results)
+        short.append({
+            "qid": q.qid,
+            "student_answer": q.student_text,
+            "embedding_score": emb,
+            "llm_result": llm_result,
+            "rubric_result": rubric,
+            "final_score": clamp(final),
+            "needs_review": review,
+        })
 
-    # Important: max_marks stays 50 only when all 15 short answers produced
-    # result records. A missing result is a pipeline failure and is flagged.
-    max_marks = 20 + 15 * 2
-
-    pipeline_review = (
-        len(short_results) != len(SHORT_ANSWER_QIDS)
-        or bool(missing)
+    mcq_marks = sum(r.score / 100 for r in mcqs)
+    short_marks = sum(
+        r["final_score"] / 100 * 2
+        for r in short
     )
 
     return {
         "student_id": student_id,
-        "total_marks": round(mcq_marks + short_marks, 2),
-        "max_marks": max_marks,
+        "total_marks": round(
+            mcq_marks + short_marks, 2
+        ),
+        "max_marks": 50,
         "mcq_marks": round(mcq_marks, 2),
         "short_answer_marks": round(short_marks, 2),
         "needs_review": (
-            pipeline_review
-            or any(r.needs_review for r in mcq_results)
-            or any(r.needs_review for r in short_results)
+            bool(missing)
+            or any(r.needs_review for r in mcqs)
+            or any(r["needs_review"] for r in short)
         ),
-        "mcq_results": mcq_results,
-        "short_results": short_results,
+        "mcq_results": mcqs,
+        "short_results": short,
         "missing_qids": missing,
         "recovered": recovered,
         "created_at": datetime.now(timezone.utc),
@@ -444,104 +320,85 @@ def main():
     parser = argparse.ArgumentParser(
         description="Grade the Mendeley exam dataset."
     )
-
+    parser.add_argument("--dataset-dir", default="data")
+    parser.add_argument("--limit", type=int)
     parser.add_argument(
-        "--dataset-dir",
-        default=MENDELEY_DIR,
+        "--student",
+        nargs="+",
+        help="Specific student IDs, e.g. Student_10 Student_11",
     )
-
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--n-samples",
-        type=int,
-        default=1,
-        help=(
-            "LLM self-consistency samples. Start with 1 while debugging "
-            "API/rate-limit behaviour."
-        ),
-    )
-
-    parser.add_argument(
-        "--requests-per-second",
-        type=float,
-        default=1.0,
-        help=(
-            "Max Mistral chat-completion calls/second for the LLM judge. "
-            "Defaults to 1.0, matching Mistral's Free/Experiment tier "
-            "(https://admin.mistral.ai/plateforme/limits shows your "
-            "workspace's actual tier -- raise this if yours allows more)."
-        ),
-    )
-
+    parser.add_argument("--n-samples", type=int, default=1)
+    parser.add_argument("--requests-per-second", type=float, default=0.5)
+    parser.add_argument("--batch-size", type=int, default=5)
     args = parser.parse_args()
 
-    answer_key_path = os.path.join(
-        args.dataset_dir,
-        "answerkey.txt",
+    key = load_answer_key(
+        os.path.join(args.dataset_dir, "answerkey.txt")
     )
-    student_pdf_dir = os.path.join(
+    pdf_dir = os.path.join(
         args.dataset_dir,
         "Student_Pdf",
     )
 
-    mistral_client = Mistral(api_key=API_KEY)
+    mistral = Mistral(api_key=MISTRAL_KEY)
+    groq = Groq(api_key=GROQ_KEY)
 
     calibrator = LLMCalibrator(
-        mistral_client,
+        groq,
         model=CALIBRATION_MODEL,
         n_samples=args.n_samples,
         requests_per_second=args.requests_per_second,
+        batch_size=args.batch_size,
     )
+
+    print("Calibration provider: GROQ")
+    print(f"Calibration model : {CALIBRATION_MODEL}")
 
     embedder = SentenceTransformer(
         "all-MiniLM-L6-v2"
     )
 
-    answer_key = load_answer_key(answer_key_path)
-
-    if not answer_key:
-        raise RuntimeError(
-            f"No answer key entries parsed from {answer_key_path}"
-        )
-
-    mongo_client = MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=5000,
-    )
-    mongo_client.admin.command("ping")
-    collection = mongo_client["aae"]["mendeley_results"]
-
-    filenames = sorted(
-        f
-        for f in os.listdir(student_pdf_dir)
+    files = sorted(
+        f for f in os.listdir(pdf_dir)
         if f.lower().endswith(".pdf")
     )
 
-    if args.limit:
-        filenames = filenames[:args.limit]
+    if args.student:
+        wanted = set(args.student)
+        files = [
+            f for f in files
+            if os.path.splitext(f)[0] in wanted
+        ]
 
-    for filename in filenames:
-        student_id = os.path.splitext(filename)[0]
-        pdf_path = os.path.join(student_pdf_dir, filename)
+    elif args.limit:
+        files = files[:args.limit]
+
+    mongo = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+    )
+    mongo.admin.command("ping")
+    collection = mongo["aae"]["results"]
+
+    for filename in files:
+        student_id = os.path.splitext(
+            filename
+        )[0]
 
         print(f"\nGrading {student_id}...")
+        calibrator.reset()
 
         result = grade_student(
             student_id,
-            pdf_path,
-            answer_key,
-            mistral_client,
+            os.path.join(pdf_dir, filename),
+            key,
+            mistral,
             embedder,
             calibrator,
         )
 
-        doc = {
-            "student_id": result["student_id"],
+        collection.insert_one({
+            "student_id": student_id,
             "total_marks": result["total_marks"],
             "max_marks": result["max_marks"],
             "mcq_marks": result["mcq_marks"],
@@ -561,88 +418,74 @@ def main():
             ],
             "short_answer_breakdown": [
                 {
-                    "qid": r.qid,
-                    "embedding_score": r.embedding_score,
-                    "llm_score_mean": getattr(
-                        r.llm_result,
-                        "llm_score_mean",
-                        None,
-                    ),
-                    "llm_score_std": getattr(
-                        r.llm_result,
-                        "llm_score_std",
-                        None,
-                    ),
-                    "rubric_score": getattr(
-                        r.rubric_result,
-                        "score",
-                        0,
-                    ),
-                    "rubric_matched": getattr(
-                        r.rubric_result,
-                        "matched_keypoints",
-                        [],
-                    ),
-                    "rubric_missed": getattr(
-                        r.rubric_result,
-                        "missed_keypoints",
-                        [],
-                    ),
-                    "final_score": r.final_score,
-                    "reasoning": r.reasoning,
-                    "needs_review": r.needs_review,
+                    "qid": r["qid"],
+                    "student_answer": r["student_answer"],
+                    "embedding_score": r["embedding_score"],
+                    "llm_scores": r["llm_result"].llm_scores,
+                    "llm_score_mean": r["llm_result"].llm_score_mean,
+                    "llm_score_std": r["llm_result"].llm_score_std,
+                    "calibration_status": r["llm_result"].calibration_status,
+                    "reasoning": r["llm_result"].reasoning,
+                    "matched_evidence": r["llm_result"].matched_evidence,
+                    "missing_evidence": r["llm_result"].missing_evidence,
+                    "discrepancy": r["llm_result"].discrepancy,
+                    "rubric_score": r["rubric_result"].score,
+                    "rubric_matched": r["rubric_result"].matched_keypoints,
+                    "rubric_missed": r["rubric_result"].missed_keypoints,
+                    "final_score": r["final_score"],
+                    "needs_review": r["needs_review"],
                 }
                 for r in result["short_results"]
             ],
             "created_at": result["created_at"],
-        }
-
-        collection.insert_one(doc)
+        })
 
         print(
-            f"  Total: {result['total_marks']}/{result['max_marks']}"
-            f"{'  REVIEW' if result['needs_review'] else ''}"
+            f"Total: {result['total_marks']}/50"
+            f"{'REVIEW' if result['needs_review'] else ''}"
         )
 
         for r in result["mcq_results"]:
             mark = (
-                "✓"
-                if r.is_correct
-                else ("?" if r.needs_review else "✗")
+                "Correct!" if r.is_correct
+                else "?" if r.needs_review
+                else "Wrong!"
             )
             print(
-                f"    Q{r.qid} [MCQ] {mark} "
+                f" Q{r.qid} [MCQ] {mark} "
                 f"student={r.student_option!r} "
                 f"correct={r.correct_option!r}"
             )
 
         for r in result["short_results"]:
-            llm_mean = getattr(
-                r.llm_result,
-                "llm_score_mean",
-                None,
+            l, rub = r["llm_result"], r["rubric_result"]
+            std = (
+                f" ±{l.llm_score_std}"
+                if l.llm_score_std is not None
+                else " n/a"
             )
-            llm_std = getattr(
-                r.llm_result,
-                "llm_score_std",
-                None,
-            )
-            rubric = getattr(
-                r.rubric_result,
-                "score",
-                0,
-            )
-
-            flag = "  REVIEW" if r.needs_review else ""
 
             print(
-                f"    Q{r.qid} [SHORT] "
-                f"{r.final_score}/100 "
-                f"(emb {r.embedding_score}, "
-                f"llm {llm_mean}, "
-                f"rubric {rubric})"
-                f"{flag}"
+                f"    Q{r['qid']} [SHORT] "
+                f"{r['final_score']}/100 "
+                f"(emb {r['embedding_score']}, "
+                f"llm {l.llm_score_mean}{std}, "
+                f"rubric {rub.score})"
+                f"{'  REVIEW' if r['needs_review'] else ''}"
             )
+
+            if l.reasoning:
+                print(f"      Reason: {l.reasoning}")
+            if l.matched_evidence:
+                print(
+                    "      Matched: "
+                    + "; ".join(l.matched_evidence)
+                )
+            if l.missing_evidence:
+                print(
+                    "      Missing: "
+                    + "; ".join(l.missing_evidence)
+                )
 
 
 if __name__ == "__main__":

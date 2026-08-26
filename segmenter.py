@@ -25,9 +25,7 @@ _QUESTION_HEADER = re.compile(
 def split_by_question_header(text: str) -> Dict[str, str]:
     """Split text into {question_number: body_text}. Returns {} if fewer
     than 2 headers are found — i.e. no clear per-question structure.
-
-    Public so other modules (mendeley_loader.py) can reuse the same
-    header convention instead of re-implementing question detection."""
+    """
     matches = list(_QUESTION_HEADER.finditer(text))
     if len(matches) < 2:
         return {}
