@@ -9,13 +9,6 @@ from pymongo import MongoClient
 from calibrator import LLMCalibrator
 from segmenter import segment_answers
 
-
-# =========================
-# CONFIG
-# =========================
-# Prefer environment variables (see .env.example); fall back to the old
-# placeholders so the script still runs if someone hasn't set up a .env yet.
-# Never commit real keys here.
 API_KEY = os.getenv("MISTRAL_API_KEY")
 
 MODEL_ANSWER_PDF = "model ans.pdf"
@@ -31,17 +24,10 @@ MONGO_URI = (
 )
 
 
-# =========================
-# DATABASE
-# =========================
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["aae"]
 collection = db["results"]
 
-
-# =========================
-# OCR
-# =========================
 def extract_text_from_pdf(pdf_path, client):
     upload = client.files.upload(
         file={
@@ -64,9 +50,6 @@ def extract_text_from_pdf(pdf_path, client):
     return "\n".join(page.markdown for page in ocr_response.pages)
 
 
-# =========================
-# SIMILARITY
-# =========================
 def embed_similarity_score(embedder, text_a, text_b):
     """0-100 SBERT cosine-similarity score between two text segments."""
     if not text_a.strip() or not text_b.strip():
@@ -76,9 +59,6 @@ def embed_similarity_score(embedder, text_a, text_b):
     return round(util.cos_sim(emb1, emb2).item() * 100)
 
 
-# =========================
-# EVALUATION
-# =========================
 def grade_for_score(score):
     """Map a final 0-100 score to (status, grade, template feedback)."""
     if score < 45:
@@ -99,9 +79,6 @@ def grade_for_score(score):
         return "PASS", "C", "Average answer. Important details are missing."
 
 
-# =========================
-# MAIN
-# =========================
 def main():
     student_reg_no = input("Enter Student Register Number: ").strip()
 
@@ -109,26 +86,25 @@ def main():
     calibrator = LLMCalibrator(mistral_client, model=CALIBRATION_MODEL)
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-    print("📄 Extracting Model Answer...")
+    print("Extracting Model Answer...")
     model_text = extract_text_from_pdf(MODEL_ANSWER_PDF, mistral_client)
 
-    print("📝 Extracting Student Answer...")
+    print("Extracting Student Answer...")
     student_text = extract_text_from_pdf(STUDENT_ANSWER_PDF, mistral_client)
 
-    print("✂️  Segmenting answer sheet by question...")
+    print("Segmenting answer sheet by question...")
     segments = segment_answers(model_text, student_text)
     print(f"   Found {len(segments)} question(s): {', '.join('Q' + s.qid for s in segments)}")
 
-    print("📊 Calculating per-question similarity...")
+    print("Calculating per-question similarity...")
     embedding_scores = [embed_similarity_score(embedder, s.model_text, s.student_text) for s in segments]
 
-    print(f"🧭 Calibrating with self-consistency judge ({calibrator.n_samples} samples/question)...")
+    print(f"Calibrating with self-consistency judge ({calibrator.n_samples} samples/question)...")
     result = calibrator.calibrate_document(segments, embedding_scores)
 
     status, grade, template_feedback = grade_for_score(result.final_score)
     feedback = result.reasoning if result.calibration_status != "unavailable" else template_feedback
 
-    # Store in MongoDB
     doc = {
         "student_reg_no": student_reg_no,
         "score": result.final_score,
@@ -162,7 +138,7 @@ def main():
     collection.insert_one(doc)
 
     # Display result
-    print("\n====== RESULT ======")
+    print("\nRESULT")
     print(f"Reg No : {student_reg_no}")
     print(f"Status : {status}")
     print(f"Score  : {result.final_score}/100  (embedding: {result.embedding_score})")
@@ -170,8 +146,8 @@ def main():
 
     for q in result.questions:
         label = f"Q{q.qid}" if q.qid != "full" else "Overall"
-        spread = f"±{q.llm_score_std}" if q.llm_score_std is not None else "n/a"
-        flag = "  ⚠️ review" if q.needs_review else ""
+        spread = f"+/-{q.llm_score_std}" if q.llm_score_std is not None else "n/a"
+        flag = "  review" if q.needs_review else ""
         print(f"\n--- {label}: {q.final_score}/100 "
               f"(embedding {q.embedding_score}, LLM {q.llm_score_mean} {spread}){flag}")
         print(f"  {q.reasoning}")
@@ -182,7 +158,7 @@ def main():
 
     if result.needs_review:
         print(
-            "\n⚠️  One or more questions flagged for human review "
+            "\n One or more questions flagged for human review "
             "(judge/embedding disagreement or unstable self-consistency scores)."
         )
 

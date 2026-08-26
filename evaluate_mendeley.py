@@ -13,7 +13,7 @@ from calibrator import LLMCalibrator
 from mcq_grader import grade_mcq
 from mendeley_loader import MCQ_QIDS, SHORT_ANSWER_QIDS, load_answer_key
 from segmenter import QuestionSegment
-from short_answer_grader import grade_short_answer
+from short_answer_grader import combine_short_answer_signals
 
 
 load_dotenv(override=True)
@@ -330,7 +330,14 @@ def grade_student(
     # -------------------------
     # SHORT ANSWERS
     # -------------------------
-    short_results = []
+    # Build every question's segment + embedding score first (both are
+    # local -- no API calls), then grade the whole set in ONE calibrator
+    # call (per self-consistency sample) instead of one call per question.
+    # See calibrator.calibrate_batch for why this is the actual fix for
+    # rate-limit exhaustion, not just a slower version of the old loop.
+    short_segments = []
+    short_key_entries = {}
+    short_embedding_scores = {}
 
     for qid in SHORT_ANSWER_QIDS:
         if qid not in answer_key:
@@ -349,33 +356,40 @@ def grade_student(
             student_text=student_body,
         )
 
-        embedding_score = embed_similarity_score(
+        short_segments.append(segment)
+        short_key_entries[qid] = key_entry
+        short_embedding_scores[qid] = embed_similarity_score(
             embedder,
             key_entry.model_answer,
             student_body,
         )
 
-        try:
-            result = grade_short_answer(
-                segment,
-                key_entry,
-                embedding_score,
-                calibrator,
-            )
-        except Exception as exc:
-            print(
-                f"    Q{qid} LLM/short-answer exception: "
-                f"{type(exc).__name__}: {exc}"
-            )
+    try:
+        llm_results = calibrator.calibrate_batch(short_segments, short_embedding_scores)
+    except Exception as exc:
+        print(f"    Batch LLM calibration exception: {type(exc).__name__}: {exc}")
+        llm_results = {}
 
-            # There is no legitimate LLM score when the call failed.
-            result = None
+    short_results = []
 
-        if result is None:
-            # The current short_answer_grader contract apparently may return
-            # no result. Do not fabricate a structured answer.
+    for segment in short_segments:
+        qid = segment.qid
+        key_entry = short_key_entries[qid]
+        embedding_score = short_embedding_scores[qid]
+        llm_result = llm_results.get(qid)
+
+        if llm_result is None:
+            # The batch call itself raised before producing any per-
+            # question result -- there is no legitimate LLM score here.
             print(f"    Q{qid} has no grading result -> REVIEW")
             continue
+
+        result = combine_short_answer_signals(
+            segment,
+            key_entry,
+            embedding_score,
+            llm_result,
+        )
 
         llm_mean, llm_std, llm_status, reasoning = _safe_llm_status(result)
 
@@ -452,6 +466,18 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--requests-per-second",
+        type=float,
+        default=1.0,
+        help=(
+            "Max Mistral chat-completion calls/second for the LLM judge. "
+            "Defaults to 1.0, matching Mistral's Free/Experiment tier "
+            "(https://admin.mistral.ai/plateforme/limits shows your "
+            "workspace's actual tier -- raise this if yours allows more)."
+        ),
+    )
+
     args = parser.parse_args()
 
     answer_key_path = os.path.join(
@@ -469,6 +495,7 @@ def main():
         mistral_client,
         model=CALIBRATION_MODEL,
         n_samples=args.n_samples,
+        requests_per_second=args.requests_per_second,
     )
 
     embedder = SentenceTransformer(
@@ -620,4 +647,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

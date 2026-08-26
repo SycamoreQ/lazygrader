@@ -1,13 +1,7 @@
 """
 Combines three independent signals for short-answer grading (Q21-Q35):
 SBERT embedding similarity, the self-consistency LLM judge (calibrator.py),
-and rubric keypoint coverage (rubric_scorer.py). Three-way agreement is
-harder to accidentally fake than two, and each method fails differently —
-the embedder misses valid paraphrases, the LLM judge isn't perfectly
-reliable at a nonzero temperature, and keyword coverage is blind to
-correct-but-unanticipated phrasing. Blending them, and flagging review
-whenever any one signal is a real outlier, hedges against any single
-method's blind spot rather than trusting one grader alone.
+and rubric keypoint coverage (rubric_scorer.py).
 """
 
 from dataclasses import dataclass
@@ -41,6 +35,15 @@ def grade_short_answer(
     calibrator: LLMCalibrator,
 ) -> ShortAnswerResult:
     llm_result = calibrator.calibrate_question(segment, embedding_score)
+    return combine_short_answer_signals(segment, key_entry, embedding_score, llm_result)
+
+
+def combine_short_answer_signals(
+    segment: QuestionSegment,
+    key_entry: AnswerKeyEntry,
+    embedding_score: int,
+    llm_result: LLMQuestionResult,
+) -> ShortAnswerResult:
     rubric_result = score_rubric(key_entry.keypoints, segment.student_text)
 
     llm_score = llm_result.llm_score_mean if llm_result.llm_score_mean is not None else embedding_score

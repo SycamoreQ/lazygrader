@@ -2,15 +2,7 @@
 Deterministic grading for the 20 multiple-choice questions (Q1-Q20 in the
 Mendeley dataset's numbering).
 
-No LLM call needed here: once OCR has extracted the text, the student's
-marked option either matches the answer key or it doesn't. Sending this to
-an LLM (or even to embedding similarity) would add cost, latency, and a
-little noise for zero benefit over exact comparison.
-
-The one place this genuinely needs care is knowing when it *can't* tell
-what the student marked (garbled OCR, no option detected) — that's a
-different failure mode from "marked the wrong option", and gets flagged
-`needs_review` instead of silently scored as incorrect.
+No LLM call needed here
 """
 
 import re
@@ -34,8 +26,8 @@ class MCQResult:
     correct_option: Optional[str]
     student_option: Optional[str]
     is_correct: bool
-    needs_review: bool   # True when no option could be confidently read
-    score: int            # 0 or 100, same 0-100 scale as the rest of the pipeline
+    needs_review: bool  
+    score: int           
 
 
 def grade_mcq(qid: str, student_text: str, key_entry: AnswerKeyEntry) -> MCQResult:
@@ -48,7 +40,7 @@ def grade_mcq(qid: str, student_text: str, key_entry: AnswerKeyEntry) -> MCQResu
             correct_option=key_entry.correct_option,
             student_option=student_option,
             is_correct=False,
-            needs_review=True,   # couldn't determine an answer -> a human should check the OCR, not us
+            needs_review=True,  
             score=0,
         )
 

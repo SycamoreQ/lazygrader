@@ -1,37 +1,3 @@
-"""
-Evaluation / weight-tuning harness against the Mendeley dataset's ground
-truth (Teacher_manual_marks_Anonymized.csv).
-
-Two things this does that "does it run" testing can't:
-
-1. Reports how close the pipeline's scores are to a real instructor's
-   marks (MAE, RMSE, Pearson r), split by MCQ vs short-answer, so "does
-   the calibration layer actually help" has a number attached instead of
-   being a hunch.
-
-2. Grid-searches the three short-answer blend weights (embedding / LLM /
-   rubric) to find whichever combination best matches the teacher's marks
-   on your data, instead of trusting the fixed 1/3-1/3-1/3 split
-   short_answer_grader.py ships with.
-
-The grid search is deliberately decoupled from re-calling the LLM: run the
-pipeline once, cache each question's three raw signal scores per student
-as a RawQuestionSignals, and the search just re-combines those cached
-numbers — no repeat API spend for what's actually a cheap search over
-~66 weight combinations.
-
-Expected CSV shape (adjust `student_id_col` / the "Q<n>" column naming
-below if your copy differs — the dataset page describes the file as
-covering "Q1 through Q35" per student row but doesn't give exact headers):
-
-    student_id, Q1, Q2, ..., Q20, Q21, ..., Q35
-    Student_1,  1,  0, ...,  1,   1.5, ...,  2
-
-As with mendeley_loader.py, this was written from the dataset's
-documented structure, not the real file — check load_ground_truth's
-output against a few rows of the actual CSV before trusting it.
-"""
-
 import csv
 import statistics
 from dataclasses import dataclass

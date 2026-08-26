@@ -5,11 +5,7 @@ LLM judge. Checks how many of the answer key's rubric keypoints show up in
 the student's answer, using significant-word overlap rather than exact
 string matching so it survives OCR noise and rewording.
 
-This is intentionally simple — a sanity-check signal, not a replacement
-for the LLM judge. Its value is in triangulation: if a keypoint is clearly
-present by keyword coverage but the LLM says it's missing (or vice versa),
-that disagreement across independently-failing methods is exactly the
-kind of case worth a human glancing at.
+This is intentionally simple 
 """
 
 import math
@@ -54,13 +50,14 @@ class RubricResult:
 
 
 def score_rubric(keypoints: List[str], student_text: str, overlap_threshold: float = 0.4) -> RubricResult:
-    """A keypoint counts as 'matched' if at least `overlap_threshold` of its
-    IDF-weighted significant words also appear in the student's answer —
-    weighted so generic domain terms shared across most keypoints don't
-    cause a spurious match on their own (see _word_weights)."""
+    """`overlap_threshold` still decides whether a keypoint is reported as
+    'matched' vs 'missed' (for display/triangulation purposes), but the
+    numeric score is NOT a count of keypoints that cleared that threshold.
+    """
     student_words = _significant_words(student_text)
     weights = _word_weights(keypoints)
     matched, missed = [], []
+    weighted_ratios = []  # (overlap_ratio, keypoint_total_weight)
 
     for kp in keypoints:
         kp_words = _significant_words(kp)
@@ -69,10 +66,17 @@ def score_rubric(keypoints: List[str], student_text: str, overlap_threshold: flo
         total_weight = sum(weights.get(w, 1.0) for w in kp_words)
         matched_weight = sum(weights.get(w, 1.0) for w in (kp_words & student_words))
         overlap = matched_weight / total_weight if total_weight else 0.0
+        weighted_ratios.append((overlap, total_weight))
         (matched if overlap >= overlap_threshold else missed).append(kp)
 
-    total = len(matched) + len(missed)
-    coverage = len(matched) / total if total else 0.0
+    if not weighted_ratios:
+        return RubricResult()
+
+    total_weight = sum(w for _, w in weighted_ratios)
+    coverage = (
+        sum(overlap * w for overlap, w in weighted_ratios) / total_weight
+        if total_weight else 0.0
+    )
 
     return RubricResult(
         matched_keypoints=matched,
